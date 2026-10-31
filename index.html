@@ -1735,7 +1735,10 @@ async function carregarArquivoDados(f){
   try{ pacote=JSON.parse(await f.text()); }
   catch(e){ toast("Arquivo não reconhecido"); return; }
   const lista = Array.isArray(pacote) ? pacote : (pacote.lancamentos||[]);
-  if(!lista.length){ toast("Não encontrei lançamentos neste arquivo"); return; }
+  const temEstrutura = !Array.isArray(pacote) &&
+    (Array.isArray(pacote.contas) || Array.isArray(pacote.pessoas) || pacote.categorias);
+  if(!lista.length && !temEstrutura){
+    toast("Não encontrei lançamentos nem contas neste arquivo"); return; }
 
   const existentes=new Set(D.lancamentos.map(l=>l.id));
   let novos=0;
@@ -1760,12 +1763,14 @@ async function carregarArquivoDados(f){
     });
   }
   if(pacote.aprendido) D.aprendido=Object.assign({}, pacote.aprendido, D.aprendido);
-  if(!novos){ toast("Esses lançamentos já estão aqui"); return; }
 
-  const mes=lista[0].data.slice(0,7);
-  if(mes) mesAtual=mes;
+  if(!novos && lista.length){ toast("Esses lançamentos já estão aqui"); return; }
+  if(lista.length){
+    const mes=lista[0].data.slice(0,7);
+    if(mes) mesAtual=mes;
+  }
   await salvar(); selects(); meses(); render(); agendarSync();
-  toast(novos+" lançamentos carregados");
+  toast(novos ? (novos+" lançamentos carregados") : "Contas e cartões carregados");
 }
 function renderAjustes(){
   const cont=$("a-contas"); cont.innerHTML="";
@@ -2108,82 +2113,89 @@ function lerOFX(txt){
     const d=dataOFX(campoOFX(b,"DTPOSTED"));
     const v=parseFloat(String(campoOFX(b,"TRNAMT")).replace(",","."));
     if(!d || !isFinite(v) || v===0) return;
-    const nome=(campoOFX(b,"NAME")||campoOFX(b,"MEMO")||"Sem descrição").replace(/\s+/g," ").trim();
+    // junta NAME e MEMO: um traz o tipo ("Compra com Cartão"), o outro o estabelecimento
+    const nm=campoOFX(b,"NAME"), mm=campoOFX(b,"MEMO");
+    let nome=[nm,mm].filter(Boolean)
+      .filter((v,i,a)=>a.indexOf(v)===i)
+      .map(s=>s.replace(/^\d{2}[\/\-]\d{2}(\s+\d{2}:\d{2})?\s*/,"").replace(/\b\d{11,}\b/g,"").trim())
+      .filter(Boolean).join(" - ").replace(/\s+/g," ").trim() || "Sem descrição";
     out.push({data:d, desc:nome.slice(0,60), valor:Math.abs(v), entrada:v>0, fitid:campoOFX(b,"FITID")});
   });
   return out;
 }
+/* CSV de extrato. Descobre as colunas pelo conteúdo, não pelo cabeçalho:
+   bancos exportam sem cabeçalho e com a ordem que querem. O do BB vem
+   assim: data, histórico, detalhe (com o estabelecimento), documento,
+   valor, Entrada/Saída — e o sinal do valor nem sempre confere, por isso
+   a coluna Entrada/Saída manda quando existe. */
+function csvLinhas(txt){
+  const sep = (txt.match(/;/g)||[]).length >= (txt.match(/,/g)||[]).length ? ";" : ",";
+  const out=[]; let campo="", linha=[], aspas=false;
+  for(let i=0;i<txt.length;i++){
+    const c=txt[i];
+    if(c==='"'){ if(aspas && txt[i+1]==='"'){ campo+='"'; i++; } else aspas=!aspas; }
+    else if(c===sep && !aspas){ linha.push(campo); campo=""; }
+    else if((c==="\n"||c==="\r") && !aspas){
+      if(campo!=="" || linha.length){ linha.push(campo); out.push(linha); linha=[]; campo=""; }
+    }
+    else campo+=c;
+  }
+  if(campo!=="" || linha.length){ linha.push(campo); out.push(linha); }
+  return out.filter(r=>r.length>1);
+}
+const RE_DATA_CEL = /^\s*(\d{2})[\/\-](\d{2})[\/\-](\d{2,4})\s*$|^\s*(\d{4})-(\d{2})-(\d{2})/;
+const RE_DIN_CEL  = /^\s*-?\s*R?\$?\s*-?\d{1,3}(?:\.\d{3})*,\d{2}\s*-?\s*$/;
+const RE_ES_CEL   = /^\s*(entrada|sa[ií]da|cr[eé]dito|d[eé]bito|[CD])\s*$/i;
 function lerCSV(txt){
-  const linhas=txt.split(/\r?\n/).filter(l=>l.trim());
-  if(!linhas.length) return [];
-  const sep=(linhas[0].match(/;/g)||[]).length >= (linhas[0].match(/,/g)||[]).length ? ";" : ",";
-  const parte=l=>{ const r=[]; let c="",q=false;
-    for(const ch of l){ if(ch==='"'){q=!q;} else if(ch===sep&&!q){r.push(c);c="";} else c+=ch; }
-    r.push(c); return r.map(x=>x.trim().replace(/^"|"$/g,"")); };
-  const cab=parte(linhas[0]).map(x=>x.toLowerCase());
-  const acha=(...alvos)=>cab.findIndex(c=>alvos.some(a=>c.includes(a)));
-  let iD=acha("data","date"), iT=acha("desc","hist","title","lançamento","lancamento","estabelecimento"),
-      iV=acha("valor","amount","value");
-  const temCabecalho = iD>=0 && iV>=0;
-  if(!temCabecalho){ iD=0; iT=1; iV=2; }
+  const rows=csvLinhas(txt);
+  if(rows.length<2) return [];
+  const n=Math.max(...rows.map(r=>r.length));
+  const conta=(teste)=>{ const c=new Array(n).fill(0);
+    rows.forEach(r=>r.forEach((v,i)=>{ if(teste(String(v||""))) c[i]++; })); return c; };
+  const cData=conta(v=>RE_DATA_CEL.test(v));
+  const cDin =conta(v=>RE_DIN_CEL.test(v));
+  const cES  =conta(v=>RE_ES_CEL.test(v));
+  const maior=a=>a.indexOf(Math.max(...a));
+  const iD=maior(cData), iV=maior(cDin), iE=Math.max(...cES)>=rows.length*0.4?maior(cES):-1;
+  if(cData[iD]===0 || cDin[iV]===0) return [];
+
   const out=[];
-  linhas.slice(temCabecalho?1:0).forEach(l=>{
-    const c=parte(l); if(c.length<2) return;
-    let ds=c[iD]||"";
-    let d=null;
-    let m=ds.match(/^(\d{2})[\/\-](\d{2})[\/\-](\d{4})/);
-    if(m) d=m[3]+"-"+m[2]+"-"+m[1];
-    else { m=ds.match(/^(\d{4})-(\d{2})-(\d{2})/); if(m) d=m[0]; }
-    if(!d) return;
-    let vs=String(c[iV]||"").replace(/[R$\s]/g,"");
-    if(vs.includes(",")) vs=vs.replace(/\./g,"").replace(",",".");
-    const v=parseFloat(vs);
-    if(!isFinite(v)||v===0) return;
-    out.push({data:d, desc:(c[iT]||"Sem descrição").slice(0,60), valor:Math.abs(v), entrada:v>0, fitid:""});
+  rows.forEach(r=>{
+    const bruta=String(r[iD]||"");
+    let data=null;
+    let m=bruta.match(/(\d{2})[\/\-](\d{2})[\/\-](\d{2,4})/);
+    if(m){ const a=m[3].length===2?"20"+m[3]:m[3]; data=a+"-"+m[2]+"-"+m[1]; }
+    else { m=bruta.match(/(\d{4})-(\d{2})-(\d{2})/); if(m) data=m[0]; }
+    if(!data) return;
+    let vs=String(r[iV]||"").replace(/[R$\s]/g,"");
+    const negFim=/-$/.test(vs);
+    vs=vs.replace(/-/g,"");
+    const num=parseFloat(vs.replace(/\./g,"").replace(",","."));
+    if(!isFinite(num)||num===0) return;
+
+    // descrição: as colunas de texto, sem a data/hora que o banco repete nelas
+    const partes=[];
+    r.forEach((v,i)=>{
+      if(i===iD||i===iV||i===iE) return;
+      let s=String(v||"").trim();
+      if(!s) return;
+      if(/^\d{5,}$/.test(s)) return;                       // número do documento
+      s=s.replace(/^\d{2}[\/\-]\d{2}(\s+\d{2}:\d{2})?\s*/,"");  // "02/10 13:55 "
+      s=s.replace(/^\d{3,}\s+\d+\s*/,"");                 // "237 0386 "
+      s=s.replace(/\b\d{11,}\b/g,"").trim();              // CPF/CNPJ solto
+      if(s) partes.push(s);
+    });
+    let desc=partes.join(" - ").replace(/\s+/g," ").trim() || "Sem descrição";
+    if(/saldo\s*(do\s*dia|anterior|em|atual|final|dispon|inicial)/i.test(desc)) return;
+
+    let entrada;
+    const es=iE>=0?String(r[iE]||"").trim().toLowerCase():"";
+    if(es){ entrada = /^(entrada|cr[eé]dito|c)$/.test(es); }   // a coluna manda
+    else if(negFim || /^-/.test(String(r[iV]||"").trim())) entrada=false;
+    else entrada = RE_ENTRADA.test(desc);
+    out.push({data, desc:desc.slice(0,60), valor:Math.abs(num), entrada, fitid:""});
   });
   return out;
-}
-/* O extrato do banco escreve o nome completo do estabelecimento
-   ("FARMACIA CENTRAL LTDA"), enquanto você digitou o apelido ("farmácia").
-   Casa por começo de palavra, não só por igualdade. */
-function aprendidoPara(desc){
-  const k=chave(desc);
-  if(!k) return null;
-  if(D.aprendido[k]) return D.aprendido[k];
-  let melhor=null, tam=0;
-  Object.keys(D.aprendido).forEach(a=>{
-    if(a.length<4) return;
-    if(k.startsWith(a) || a.startsWith(k)){
-      const n=Math.min(a.length,k.length);
-      if(n>tam){ tam=n; melhor=D.aprendido[a]; }
-    }
-  });
-  return melhor;
-}
-/* Movimento interno não é gasto nem renda: é dinheiro trocando de bolso.
-   Reconhece pelo texto do extrato e, quando dá, acha a conta do outro lado. */
-const PISTAS = [
-  {re:/pagto?\s*(de\s*)?(cart|fatura)|pagamento\s*(de\s*)?(cart|fatura)|fatura\s*cart/i, tipo:"fatura",  saida:true},
-  {re:/aplicac|aplicaç|investiment|cdb|poupanc|poupanç|tesouro|fundo|rdb|lci|lca/i,          tipo:"aporte",  saida:true},
-  {re:/resgate|resgat/i,                                                                     tipo:"resgate", saida:false},
-  {re:/transf|ted\b|doc\b|entre\s*contas|mesma\s*titularidade/i,                          tipo:"transferencia"}
-];
-function sugerirMovimento(x, contaId){
-  const saida = !x.entradaFinal;
-  for(const p of PISTAS){
-    if(!p.re.test(x.desc)) continue;
-    if(p.saida===true  && !saida) continue;
-    if(p.saida===false &&  saida) continue;
-    if(p.tipo==="fatura")  return {tipo:"fatura",  destino:palpiteConta("credito")};
-    if(p.tipo==="aporte")  return {tipo:"aporte",  destino:palpiteConta("investimento")};
-    if(p.tipo==="resgate") return {tipo:"resgate", destino:contaId, origem:palpiteConta("investimento")};
-    return {tipo:"transferencia", destino:palpiteConta("conta", contaId)};
-  }
-  return null;
-}
-function palpiteConta(tipo, excetoId){
-  const c=D.contas.filter(x=>x.tipo===tipo && x.id!==excetoId);
-  return c.length?c[0].id:"";
 }
 /* ---------------------------------------------------------------
    PDF e texto colado — para quem só tem o banco no celular.
@@ -2223,50 +2235,123 @@ async function textoDoPdf(file){
 /* Lê extrato em texto solto: PDF convertido, ou texto copiado do app do banco.
    Aceita "12/09 COMPRA CARTAO 162,80 D", "12/09/2026 ... -162,80", etc. */
 /* Sem marcador de débito/crédito, estas palavras indicam dinheiro entrando. */
-const RE_ENTRADA = /\b(recebid[ao]|recebimento|credito|crédito|deposito|depósito|salario|salário|provento|estorno|devolu|reembolso|resgate|rendimento|juros\s*credit|transfer[eê]ncia\s*recebida|ted\s*recebida|doc\s*recebido|pix\s*recebido|entrada)\b/i;
-const RE_VALOR = /(-|\+)?\s*R?\$?\s*(\d{1,3}(?:\.\d{3})+,\d{2}|\d+,\d{2})(?:\s*\(?([DC])\)?)?/g;
+const RE_ENTRADA = /\b(recebid[ao]|recebimento|cr[eé]dito\s+(?:em\s+conta|de\s+sal[aá]rio|efetuado)|dep[oó]sito|sal[aá]rio|proventos?|remunera|pr[oó]-?labore|aposentad|pens[aã]o|benef[ií]cio|estorno|devolu|reembolso|resgate|rendimento|juros\s*credit|transfer[eê]ncia\s*recebida|ted\s*recebida|doc\s*recebido|pix\s*recebido|entrada)\b/i;
+/* valor com sinal antes OU depois, e marcador D/C opcional:
+   "162,80"  "-162,80"  "162,80-"  "1.234,56 D"  "R$ 89,90" */
+const RE_VALOR = /(-|\+)?\s*R?\$?\s*(\d{1,3}(?:\.\d{3})+,\d{2}|\d+,\d{2})\s*(-|\+)?(?:\s*\(?([DC])\)?)?/g;
+/* meses por extenso, como a fatura do Nubank escreve: "05 OUT" */
+const MES_ABREV = {jan:1,fev:2,mar:3,abr:4,mai:5,jun:6,jul:7,ago:8,set:9,out:10,nov:11,dez:12};
+function dataPorExtenso(l, ano){
+  const m = l.match(/\b(\d{1,2})\s*(?:de\s*)?(jan|fev|mar|abr|mai|jun|jul|ago|set|out|nov|dez)[a-zç]*\.?\b/i);
+  if(!m) return null;
+  const mm = MES_ABREV[m[2].toLowerCase()];
+  return ano+"-"+String(mm).padStart(2,"0")+"-"+String(+m[1]).padStart(2,"0");
+}
 function lerTextoLivre(txt, anoPadrao){
   const out=[]; let dataAtual=null;
   const ano = anoPadrao || new Date().getFullYear();
+  let t_pagFatura=false;
   txt.split(/\r?\n/).forEach(linha=>{
+    t_pagFatura=false;
     const l=linha.replace(/\s+/g," ").trim();
     if(!l) return;
-    if(/^(saldo|total|limite|fatura fechada|vencimento|p[aá]gina|extrato|per[ií]odo)/i.test(l)) return;
+    // linhas de saldo/total não são lançamento — o extrato as intercala entre as transações
+    const semEsp=l.replace(/\s+/g,"");
+    if(/^(total|limite|fatura fechada|vencimento|p[aá]gina|extrato|per[ií]odo)/i.test(l)) return;
+    if(/saldo\s*(do\s*dia|anterior|em|atual|final|dispon|inicial)/i.test(l)) return;
+    if(/^\d{0,2}[\/\d\s-]*saldo/i.test(l)) return;
+    if(/^[\d\/\s-]*SALDO/i.test(semEsp) || /^SALDO/i.test(semEsp)) return;
 
-    const mD = l.match(/(\d{2})\/(\d{2})(?:\/(\d{2,4}))?/);
+    /* "PARC 03/12" e "(3/12)" são marcas de parcela, não data.
+       E numa fatura agrupada por dia, a linha da compra não traz data própria:
+       nesse caso só uma data COMPLETA (com ano) pode substituir a do grupo. */
+    const semParc = l.replace(/\bparc(?:ela)?\.?\s*\d{1,2}\s*[\/ ]\s*\d{1,2}\b/ig," ")
+                     .replace(/\(\s*\d{1,2}\s*\/\s*\d{1,2}\s*\)/g," ");
+    const mFull = semParc.match(/(\d{2})\/(\d{2})\/(\d{2,4})/);
+    const mD = mFull || (dataAtual ? null : semParc.match(/(\d{2})\/(\d{2})(?!\/)/));
+    const dExt = dataPorExtenso(l, ano);
     const vals = [...l.matchAll(RE_VALOR)];
-    if(mD && !vals.length){
-      let a = mD[3] ? (mD[3].length===2 ? "20"+mD[3] : mD[3]) : ano;
-      dataAtual = a+"-"+mD[2]+"-"+mD[1];
+    // linha só com a data: vale para as linhas seguintes (fatura agrupada por dia)
+    if((mD || dExt) && !vals.length){
+      if(dExt) dataAtual=dExt;
+      else { const a=mD[3]?(mD[3].length===2?"20"+mD[3]:mD[3]):ano; dataAtual=a+"-"+mD[2]+"-"+mD[1]; }
       return;
     }
     if(!vals.length) return;
 
     let data=dataAtual;
-    if(mD){
-      let a = mD[3] ? (mD[3].length===2 ? "20"+mD[3] : mD[3]) : ano;
-      data = a+"-"+mD[2]+"-"+mD[1];
-    }
+    if(mD){ const a=mD[3]?(mD[3].length===2?"20"+mD[3]:mD[3]):ano; data=a+"-"+mD[2]+"-"+mD[1]; }
+    else if(dExt) data=dExt;
     if(!data) return;
 
     // a primeira quantia da linha é o lançamento; a segunda costuma ser o saldo
     const v=vals[0];
     const num=parseFloat(v[2].replace(/\./g,"").replace(",","."));
     if(!isFinite(num)||num===0) return;
+    const sinal = v[1] || v[3];          // antes ou depois do número
     let entrada;
-    if(v[3]) entrada = v[3].toUpperCase()==="C";
-    else if(v[1]==="-") entrada=false;
-    else if(v[1]==="+") entrada=true;
-    else entrada = RE_ENTRADA.test(l);   // sem sinal: decide pelo texto
+    if(v[4]) entrada = v[4].toUpperCase()==="C";          // D/C explícito manda
+    else if(RE_ENTRADA.test(l)) entrada=true;             // estorno, salário, recebida…
+    else if(sinal==="-") entrada=false;
+    else if(sinal==="+") entrada=true;
+    else entrada=false;
+    t_pagFatura = /pag(amen)?to.{0,12}(fatura|cart)/i.test(l);
 
-    let desc=l.replace(/(\d{2})\/(\d{2})(\/(\d{2,4}))?/,"");
+    let desc=l;
+    if(mD) desc=desc.replace(mD[0],"");
+    else if(dExt) desc=desc.replace(/\b\d{1,2}\s*(?:de\s*)?(jan|fev|mar|abr|mai|jun|jul|ago|set|out|nov|dez)[a-zç]*\.?\b/i,"");
     vals.forEach(m=> desc=desc.replace(m[0],""));
     desc=desc.replace(/\s+/g," ").replace(/^[\s\-–—|]+|[\s\-–—|]+$/g,"").trim();
     if(!desc) desc="Sem descrição";
     out.push({data, desc:desc.slice(0,60), valor:Math.abs(num),
-              entrada, fitid:"", varios:vals.length>1});
+              entrada, fitid:"", varios:vals.length>1, pagFatura:t_pagFatura});
   });
   return out;
+}
+
+/* O extrato escreve o nome completo do estabelecimento ("NENE SUPERMERCADO"),
+   enquanto você pode ter digitado o apelido ("Nene"). Casa por começo. */
+function aprendidoPara(desc){
+  const k=chave(desc);
+  if(!k) return null;
+  if(D.aprendido[k]) return D.aprendido[k];
+  let melhor=null, tam=0;
+  Object.keys(D.aprendido).forEach(a=>{
+    if(a.length<4) return;
+    if(k.startsWith(a) || a.startsWith(k)){
+      const n=Math.min(a.length,k.length);
+      if(n>tam){ tam=n; melhor=D.aprendido[a]; }
+    }
+  });
+  return melhor;
+}
+
+/* Movimento interno não é gasto nem renda: é dinheiro trocando de bolso.
+   Reconhece pelo texto do extrato e, quando dá, acha a conta do outro lado. */
+const RE_RENDA = /\b(proventos?|sal[aá]rio|remunera|13[.º°]?\s*sal|f[ée]rias|pr[oó]-?labore|aposentad|pens[aã]o|benef[ií]cio)\b/i;
+const PISTAS = [
+  {re:/pagto?\s*(de\s*)?(cart|fatura)|pagamento\s*(de\s*)?(cart|fatura)|fatura\s*cart/i, tipo:"fatura",  saida:true},
+  {re:/aplicac|aplicaç|investiment|cdb|poupanc|poupanç|tesouro|fundo|rdb|lci|lca/i,          tipo:"aporte",  saida:true},
+  {re:/resgate|resgat/i,                                                                     tipo:"resgate", saida:false},
+  {re:/transf|ted\b|doc\b|entre\s*contas|mesma\s*titularidade/i,                          tipo:"transferencia"}
+];
+function palpiteConta(tipo, excetoId){
+  const c=D.contas.filter(x=>x.tipo===tipo && x.id!==excetoId);
+  return c.length?c[0].id:"";
+}
+function sugerirMovimento(x, contaId){
+  const saida = !x.entradaFinal;
+  if(RE_RENDA.test(x.desc)) return null;   // é renda: fica como entrada comum
+  for(const p of PISTAS){
+    if(!p.re.test(x.desc)) continue;
+    if(p.saida===true  && !saida) continue;
+    if(p.saida===false &&  saida) continue;
+    if(p.tipo==="fatura")  return {tipo:"fatura",  destino:palpiteConta("credito")};
+    if(p.tipo==="aporte")  return {tipo:"aporte",  destino:palpiteConta("investimento")};
+    if(p.tipo==="resgate") return {tipo:"resgate", destino:contaId, origem:palpiteConta("investimento")};
+    return {tipo:"transferencia", destino:palpiteConta("conta", contaId)};
+  }
+  return null;
 }
 
 /* ---------------------------------------------------------------
@@ -2320,7 +2405,7 @@ async function abrirExtrato(f){
   }
   let t;
   if(/<STMTTRN>/i.test(txt)) t=lerOFX(txt);
-  else if(!ehPdf && /^[^\n]*[;,][^\n]*[;,]/.test(txt) && lerCSV(txt).length) t=lerCSV(txt);
+  else if(!ehPdf && /[;,]/.test(txt) && lerCSV(txt).length) t=lerCSV(txt);
   else t=lerTextoLivre(txt);
   if(!t.length){
     toast(/pdf|^%PDF/i.test(txt.slice(0,8)) || f.name.toLowerCase().endsWith(".pdf")
@@ -2361,8 +2446,9 @@ function renderConferencia(){
   t.innerHTML="<thead><tr><th style='width:34px'></th><th>Data</th><th>Descrição</th><th>O que é</th><th>Categoria ou destino</th><th class='r'>Valor</th></tr></thead>";
   const tb=el("tbody");
   pendentes.forEach((x,i)=>{
-    const rep=x.repetido || !!x.possivel;
-    if(x.repetido) repetidos++; else if(x.possivel) duvidosos++; else novos++;
+    const pular = cartao && x.pagFatura;   // pagamento da própria fatura
+    const rep=x.repetido || !!x.possivel || pular;
+    if(x.repetido) repetidos++; else if(x.possivel) duvidosos++; else if(!pular) novos++;
     if(!x.marcadoManual) x.marcado=!rep;
     // cartão: valor positivo no OFX costuma ser estorno/pagamento
     x.entradaFinal = inverterSinal ? !x.entrada : x.entrada;
@@ -2382,7 +2468,11 @@ function renderConferencia(){
     c0.appendChild(cb); tr.appendChild(c0);
     tr.appendChild(el("td","money tag",x.data.slice(8,10)+"/"+x.data.slice(5,7)));
     const cd=el("td"); cd.appendChild(document.createTextNode(x.desc));
-    if(x.repetido) cd.appendChild(el("span","tag"," \u00b7 j\u00e1 lan\u00e7ado"));
+    if(pular){
+      const t3=el("span","tag"," \u00b7 pagamento da fatura \u2014 lance pela conta");
+      t3.style.color="var(--ambar)"; cd.appendChild(t3);
+    }
+    else if(x.repetido) cd.appendChild(el("span","tag"," \u00b7 j\u00e1 lan\u00e7ado"));
     else if(x.possivel){
       const t2=el("span","tag"," \u00b7 parece ser \u201c"+x.possivel+"\u201d");
       t2.style.color="var(--ambar)"; cd.appendChild(t2);
